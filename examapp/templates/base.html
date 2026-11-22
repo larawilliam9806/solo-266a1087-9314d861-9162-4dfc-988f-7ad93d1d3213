@@ -38,6 +38,10 @@
 (function () {
   const initialVersion = {{ version if version is defined else 0 }};
   const pill = document.getElementById('status-pill');
+  // The page was rendered before this job id finished; once any job reaches a
+  // terminal state (success or failure), reload so banners and stats update.
+  const latestJobId = {{ job.id if job else 'null' }};
+  let knownJobId = latestJobId;
 
   async function poll() {
     try {
@@ -50,9 +54,16 @@
           ? '<span class="pill busy">重算中</span>'
           : '<span class="pill ok">统计就绪</span>';
       }
+      const latest = data.jobs && data.jobs.length ? data.jobs[0] : null;
+      const terminal = latest && ['succeeded', 'failed'].includes(latest.status);
       if (data.version !== initialVersion) {
         location.reload();
+      } else if (terminal && latest.id !== knownJobId) {
+        // A job accepted while the page was open has finished (including a
+        // failure whose reason must become visible).
+        location.reload();
       }
+      if (latest) knownJobId = latest.id;
     } catch (e) { /* keep polling */ }
   }
   poll();

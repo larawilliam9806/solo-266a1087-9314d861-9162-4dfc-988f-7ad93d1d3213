@@ -531,3 +531,378 @@ def test_queued_job_replayed_after_restart(app):
         time.sleep(0.05)
     assert result is not None
     assert result["stats"]["Q1"]["counted"] == 1
+
+
+# --------------------------------------------------------------------------
+# CSV staging, space reclamation and restart-safe cleanup
+# --------------------------------------------------------------------------
+
+def _staging_files(app):
+    return {n for n in os.listdir(app.config["STAGING_DIR"])
+            if os.path.isfile(os.path.join(app.config["STAGING_DIR"], n))}
+
+
+def _job_payload(app, job_id):
+    conn = db.connect(app.config["DB_PATH"])
+    try:
+        import json as _json
+        return _json.loads(conn.execute(
+            "SELECT payload FROM jobs WHERE id = ?", (job_id,)
+        ).fetchone()["payload"])
+    finally:
+        conn.close()
+
+
+def test_finished_job_releases_staging_csv_and_payload(client, app):
+    upload(client, "/forms", A_FORM, name="A卷")
+    upload(client, "/answers", answer_csv([
+        ("C1", "1", "A", "Q1"), ("C1", "2", "B", "Q2"),
+    ]))
+    assert _staging_files(app) == set()
+    conn = db.connect(app.config["DB_PATH"])
+    try:
+        for row in conn.execute("SELECT payload FROM jobs"):
+            payload = __import__("json").loads(row["payload"])
+            assert "csv" not in payload
+            assert "csv_file" not in payload
+    finally:
+        conn.close()
+
+
+def test_queued_and_running_jobs_keep_their_staging_csv(app):
+    import threading
+    import time
+    from examapp import app as app_module
+
+    client = app.test_client()
+    upload(client, "/forms", A_FORM, name="A卷")
+    app.worker.sync = False
+
+    started = threading.Event()
+    release = threading.Event()
+    original = app_module._do_upload_answers
+
+    def slow(conn, payload):
+        started.set()
+        release.wait(timeout=10)
+        original(conn, payload)
+
+    app_module._do_upload_answers = slow
+    try:
+        job_id = app.worker.submit("upload_answers", {
+            "csv": answer_csv([("C1", "1", "B", "Q1"), ("C1", "2", "B", "Q2")]),
+        })
+        assert started.wait(timeout=5)
+        # The raw CSV must remain on disk while the job is running, and the
+        # database row only references it by file name.
+        files = _staging_files(app)
+        assert len(files) == 1
+        payload = _job_payload(app, job_id)
+        assert "csv" not in payload
+        assert payload["csv_file"] in files
+        release.set()
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            conn = db.connect(app.config["DB_PATH"])
+            try:
+                busy = conn.execute(
+                    "SELECT 1 FROM jobs WHERE status IN ('queued','running')"
+                ).fetchone()
+            finally:
+                conn.close()
+            if not busy:
+                break
+            time.sleep(0.05)
+    finally:
+        release.set()
+        app_module._do_upload_answers = original
+    assert _staging_files(app) == set()
+
+
+def test_failed_job_also_releases_staging_space(client, app):
+    from examapp import app as app_module
+    original = app_module._do_upload_answers
+
+    def boom(conn, payload):
+        raise RuntimeError("disk full")
+
+    app_module._do_upload_answers = boom
+    try:
+        response = upload(client, "/answers", answer_csv([
+            ("C1", "1", "A", "Q1"), ("C1", "2", "B", "Q2"),
+        ]))
+        assert "失败" in response.get_data(as_text=True)
+    finally:
+        app_module._do_upload_answers = original
+    assert _staging_files(app) == set()
+    conn = db.connect(app.config["DB_PATH"])
+    try:
+        job = conn.execute("SELECT * FROM jobs ORDER BY id DESC LIMIT 1").fetchone()
+        assert job["status"] == "failed"
+        assert "disk full" in job["error"]
+        payload = __import__("json").loads(job["payload"])
+        assert "csv" not in payload and "csv_file" not in payload
+    finally:
+        conn.close()
+
+
+def test_staging_csv_reused_after_restart(tmp_path):
+    # A queued job's raw CSV must survive a restart and be replayed from the
+    # same staging file.
+    import json
+    import time
+    db_path = str(tmp_path / "restart.db")
+    first = create_app(db_path, sync_jobs=True)
+    staging_name = first.worker._write_staging(
+        "upload_answers",
+        answer_csv([("C1", "1", "A", "Q1"), ("C1", "2", "B", "Q2")]),
+    )
+    conn = db.connect(db_path)
+    cur = conn.execute(
+        "INSERT INTO jobs(kind, payload, status, created_at) "
+        "VALUES ('upload_answers', ?, 'queued', ?)",
+        (json.dumps({"csv_file": staging_name}), "2026-01-01 00:00:00"),
+    )
+    queued_id = cur.lastrowid
+    conn.close()
+    assert os.path.isfile(os.path.join(first.config["STAGING_DIR"], staging_name))
+
+    restarted = create_app(db_path, sync_jobs=False)
+    deadline = time.time() + 5
+    ok = False
+    while time.time() < deadline:
+        conn = db.connect(db_path)
+        try:
+            row = conn.execute(
+                "SELECT status FROM jobs WHERE id = ?", (queued_id,)
+            ).fetchone()
+            if row and row["status"] == "succeeded":
+                ok = True
+                break
+        finally:
+            conn.close()
+        time.sleep(0.05)
+    assert ok
+    # The replayed job released its own staging file on completion.
+    assert not os.path.exists(
+        os.path.join(restarted.config["STAGING_DIR"], staging_name)
+    )
+
+
+def test_legacy_inline_csv_of_finished_jobs_is_stripped_on_startup(tmp_path):
+    import json
+    db_path = str(tmp_path / "legacy.db")
+    first = create_app(db_path, sync_jobs=True)
+    # Simulate an old database whose finished jobs embed raw CSV inline.
+    conn = db.connect(db_path)
+    big_csv = answer_csv([("C1", "1", "A", "Q1"), ("C1", "2", "B", "Q2")]) * 50
+    conn.execute(
+        "INSERT INTO jobs(kind, payload, status, created_at, finished_at) "
+        "VALUES ('upload_answers', ?, 'succeeded', ?, ?)",
+        (json.dumps({"csv": big_csv}), "2026-01-01 00:00:00",
+         "2026-01-01 00:00:01"),
+    )
+    conn.execute(
+        "INSERT INTO jobs(kind, payload, status, created_at, finished_at) "
+        "VALUES ('upload_form', ?, 'failed', ?, ?)",
+        (json.dumps({"name": "A卷", "csv": "题号,选项字母\n1,A,Q1,A\n"}),
+         "2026-01-01 00:00:02", "2026-01-01 00:00:03"),
+    )
+    conn.close()
+
+    create_app(db_path, sync_jobs=True)
+    conn = db.connect(db_path)
+    try:
+        for row in conn.execute("SELECT payload FROM jobs"):
+            payload = json.loads(row["payload"])
+            assert "csv" not in payload
+            assert "csv_file" not in payload
+    finally:
+        conn.close()
+
+
+def test_payload_stripping_is_resumable_in_batches(tmp_path):
+    import json
+    import sqlite3
+    from examapp import db as db_module
+
+    db_path = str(tmp_path / "resume.db")
+    create_app(db_path, sync_jobs=True)
+    conn = db.connect(db_path)
+    total = 7
+    for i in range(total):
+        conn.execute(
+            "INSERT INTO jobs(kind, payload, status, created_at, finished_at) "
+            "VALUES ('upload_answers', ?, 'succeeded', ?, ?)",
+            (json.dumps({"csv": f"卡号,题号\nC{i},1\n"}),
+             "2026-01-01 00:00:00", "2026-01-01 00:00:01"),
+        )
+    conn.close()
+
+    original_batch_size = db_module.PAYLOAD_BATCH_SIZE
+    db_module.PAYLOAD_BATCH_SIZE = 2
+    try:
+        real_commit = sqlite3.Connection.commit
+        commit_count = {"n": 0}
+
+        class FailingConnection(sqlite3.Connection):
+            def commit(self):
+                commit_count["n"] += 1
+                if commit_count["n"] == 2:  # second batch cannot be written
+                    raise sqlite3.OperationalError("database or disk is full")
+                return real_commit(self)
+
+        flaky = sqlite3.connect(db_path, timeout=30,
+                                isolation_level=None, factory=FailingConnection)
+        flaky.row_factory = sqlite3.Row
+        flaky.execute("PRAGMA foreign_keys = ON")
+        db_module.strip_finished_payloads(flaky)
+        flaky.close()
+    finally:
+        db_module.PAYLOAD_BATCH_SIZE = original_batch_size
+
+    conn = db.connect(db_path)
+    try:
+        remaining = conn.execute(
+            "SELECT COUNT(*) AS n FROM jobs WHERE payload LIKE '%\"csv\"%'"
+        ).fetchone()["n"]
+    finally:
+        conn.close()
+    # The first batch (2 rows) committed; the failing second batch rolled back.
+    assert remaining == total - 2
+
+    # Next maintenance run (no injected failure) finishes everything.
+    db_module.strip_finished_payloads(db.connect(db_path))
+    conn = db.connect(db_path)
+    try:
+        remaining = conn.execute(
+            "SELECT COUNT(*) AS n FROM jobs WHERE payload LIKE '%\"csv\"%'"
+        ).fetchone()["n"]
+    finally:
+        conn.close()
+    assert remaining == 0
+
+
+def test_orphan_staging_files_are_swept_but_live_ones_kept(tmp_path):
+    import json
+    db_path = str(tmp_path / "sweep.db")
+    app = create_app(db_path, sync_jobs=True)
+    staging = app.config["STAGING_DIR"]
+    orphan = os.path.join(staging, "orphan-upload_answers-deadbeef.csv")
+    with open(orphan, "w", encoding="utf-8") as fh:
+        fh.write("old data")
+    # A queued job still needs its file.
+    live_name = app.worker._write_staging("upload_answers", "卡号,题号\nC1,1\n")
+    conn = db.connect(db_path)
+    conn.execute(
+        "INSERT INTO jobs(kind, payload, status, created_at) "
+        "VALUES ('upload_answers', ?, 'queued', ?)",
+        (json.dumps({"csv_file": live_name}), "2026-01-01 00:00:00"),
+    )
+    conn.close()
+
+    create_app(db_path, sync_jobs=True)
+    assert not os.path.exists(orphan)
+    assert os.path.isfile(os.path.join(staging, live_name))
+
+
+def test_status_api_returns_summaries_without_payloads(client, app):
+    upload(client, "/forms", A_FORM, name="A卷")
+    data = client.get("/api/status").get_json()
+    assert data["recomputing"] is False
+    assert data["jobs"]
+    job = data["jobs"][0]
+    assert set(job) == {
+        "id", "kind", "status", "error", "created_at",
+        "started_at", "finished_at", "run_id",
+    }
+    assert "payload" not in job
+    assert job["status"] == "succeeded"
+    assert job["run_id"] == data["active_run_id"]
+
+
+def test_status_api_includes_running_job(client, app):
+    import threading
+    import time
+    from examapp import app as app_module
+
+    upload(client, "/forms", A_FORM, name="A卷")
+    started = threading.Event()
+    release = threading.Event()
+    original = app_module._do_upload_answers
+
+    def slow(conn, payload):
+        started.set()
+        release.wait(timeout=10)
+        original(conn, payload)
+
+    app.worker.sync = False
+    app_module._do_upload_answers = slow
+    try:
+        app.worker.submit("upload_answers", {
+            "csv": answer_csv([("C1", "1", "B", "Q1"), ("C1", "2", "B", "Q2")]),
+        })
+        assert started.wait(timeout=5)
+        data = client.get("/api/status").get_json()
+        assert data["recomputing"] is True
+        assert data["jobs"][0]["status"] in ("running", "queued")
+        assert "payload" not in data["jobs"][0]
+    finally:
+        release.set()
+        app_module._do_upload_answers = original
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            if not client.get("/api/status").get_json()["recomputing"]:
+                break
+            time.sleep(0.05)
+
+
+def test_full_staging_directory_reports_friendly_error(client, app, monkeypatch):
+    def no_space(kind, text):
+        raise OSError("[Errno 28] No space left on device")
+
+    monkeypatch.setattr(app.worker, "_write_staging", no_space)
+    response = upload(client, "/answers", answer_csv([
+        ("C1", "1", "A", "Q1"), ("C1", "2", "B", "Q2"),
+    ]))
+    text = response.get_data(as_text=True)
+    assert "暂存空间不足" in text
+    conn = db.connect(app.config["DB_PATH"])
+    try:
+        # No queued job was created, so nothing is stuck in the queue.
+        assert conn.execute(
+            "SELECT COUNT(*) AS n FROM jobs WHERE status IN ('queued','running')"
+        ).fetchone()["n"] == 0
+    finally:
+        conn.close()
+
+
+def test_missing_staging_csv_fails_job_with_reason(tmp_path):
+    import json
+    import time
+    db_path = str(tmp_path / "missing.db")
+    app = create_app(db_path, sync_jobs=False)
+    conn = db.connect(db_path)
+    conn.execute(
+        "INSERT INTO jobs(kind, payload, status, created_at) "
+        "VALUES ('upload_answers', ?, 'queued', ?)",
+        (json.dumps({"csv_file": "gone.csv"}), "2026-01-01 00:00:00"),
+    )
+    conn.close()
+    app.worker._resume_queued()
+    deadline = time.time() + 5
+    error = None
+    while time.time() < deadline:
+        conn = db.connect(db_path)
+        try:
+            row = conn.execute(
+                "SELECT status, error FROM jobs ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+        finally:
+            conn.close()
+        if row["status"] in ("succeeded", "failed"):
+            error = row["error"]
+            assert row["status"] == "failed"
+            break
+        time.sleep(0.05)
+    assert error and "请重新上传" in error

@@ -7,6 +7,9 @@ services:
       - exam_data:/app/data
     environment:
       EXAM_DB: /app/data/app.db
+      # Raw uploaded CSVs are staged here while a job is queued/running and
+      # reclaimed once it finishes; lives on the same persistent volume.
+      EXAM_STAGING_DIR: /app/data/staging
     restart: unless-stopped
 
 volumes:

@@ -16,9 +16,12 @@ from __future__ import annotations
 import csv
 import io
 import json
+import logging
 import os
 import queue
+import sqlite3
 import threading
+import uuid
 from urllib.parse import quote
 
 from flask import (
@@ -28,8 +31,11 @@ from flask import (
 
 from . import engine
 from .db import (
-    active_run_id, connect, get_meta, init_db, set_meta, utcnow,
+    active_run_id, connect, get_meta, init_db, reclaim_storage, set_meta,
+    utcnow,
 )
+
+logger = logging.getLogger(__name__)
 
 DEFAULT_DB = os.environ.get(
     "EXAM_DB",
@@ -41,13 +47,33 @@ DEFAULT_DB = os.environ.get(
 def create_app(db_path: str | None = None, sync_jobs: bool | None = None) -> Flask:
     app = Flask(__name__)
     app.config["DB_PATH"] = db_path or DEFAULT_DB
+    staging_dir = os.environ.get("EXAM_STAGING_DIR")
+    if not staging_dir:
+        staging_dir = os.path.join(
+            os.path.dirname(os.path.abspath(app.config["DB_PATH"])), "staging"
+        )
+    app.config["STAGING_DIR"] = staging_dir
+    os.makedirs(app.config["STAGING_DIR"], exist_ok=True)
     app.config["MAX_CONTENT_LENGTH"] = 32 * 1024 * 1024
     # Tests may force synchronous job execution for determinism.
     if sync_jobs is None:
         sync_jobs = os.environ.get("EXAM_SYNC_JOBS") == "1"
     app.config["SYNC_JOBS"] = sync_jobs
     init_db(app.config["DB_PATH"])
-    app.worker = JobWorker(app.config["DB_PATH"], sync=app.config["SYNC_JOBS"])
+    # Restart-safe cleanup: strip raw CSVs from finished jobs, remove orphaned
+    # staging files and truncate the WAL so the data volume stays reusable.
+    try:
+        conn = connect(app.config["DB_PATH"])
+        try:
+            reclaim_storage(conn, app.config["STAGING_DIR"])
+        finally:
+            conn.close()
+    except sqlite3.DatabaseError:
+        logger.exception("启动时清理暂存空间失败，将在下次启动重试")
+    app.worker = JobWorker(
+        app.config["DB_PATH"], app.config["STAGING_DIR"],
+        sync=app.config["SYNC_JOBS"],
+    )
     app.teardown_appcontext(close_db)
     register_routes(app)
     return app
@@ -78,14 +104,83 @@ def close_db(exc=None):
 # --------------------------------------------------------------------------
 
 class JobWorker:
-    def __init__(self, db_path: str, sync: bool = False):
+    def __init__(self, db_path: str, staging_dir: str, sync: bool = False):
         self.db_path = db_path
+        self.staging_dir = staging_dir
         self.sync = sync
         self._queue: "queue.Queue[int]" = queue.Queue()
         self._thread: threading.Thread | None = None
         self._start_lock = threading.Lock()
+        os.makedirs(self.staging_dir, exist_ok=True)
         if not sync:
             self._resume_queued()
+
+    # -- staging files -----------------------------------------------------
+
+    def _staging_path(self, name: str) -> str:
+        # Never trust a stored name enough to leave the staging directory.
+        return os.path.join(self.staging_dir, os.path.basename(name))
+
+    def _write_staging(self, kind: str, text: str) -> str:
+        safe_kind = "".join(ch for ch in kind if ch.isalnum() or ch == "_") or "job"
+        name = f"{safe_kind}-{uuid.uuid4().hex}.csv"
+        # Write to a temporary name first so an interrupted upload never leaves
+        # a half-written file that could be mistaken for a valid CSV.
+        tmp = f"{name}.tmp"
+        with open(self._staging_path(tmp), "w", encoding="utf-8", newline="") as fh:
+            fh.write(text)
+        os.replace(self._staging_path(tmp), self._staging_path(name))
+        return name
+
+    def _load_csv_text(self, payload: dict) -> str | None:
+        if "csv" in payload:  # legacy payload written by older versions
+            return payload["csv"]
+        name = payload.get("csv_file")
+        if not name:
+            return None
+        try:
+            with open(self._staging_path(name), "r",
+                      encoding="utf-8", newline="") as fh:
+                return fh.read()
+        except FileNotFoundError:
+            raise RuntimeError(f"暂存的 CSV 原文已不存在：{name}，请重新上传")
+        except OSError as exc:
+            raise RuntimeError(f"读取暂存 CSV 失败：{exc}")
+
+    def _release_staging(self, conn, job_id: int) -> None:
+        """Drop the raw CSV of a finished job so the staging space is reusable."""
+        row = conn.execute(
+            "SELECT payload FROM jobs WHERE id = ?", (job_id,)
+        ).fetchone()
+        if row is None:
+            return
+        name = None
+        try:
+            payload = json.loads(row["payload"])
+        except (ValueError, TypeError):
+            payload = None
+        if isinstance(payload, dict):
+            name = payload.get("csv_file")
+            if "csv" in payload or "csv_file" in payload:
+                payload.pop("csv", None)
+                payload.pop("csv_file", None)
+                try:
+                    conn.execute(
+                        "UPDATE jobs SET payload = ? WHERE id = ?",
+                        (json.dumps(payload, ensure_ascii=False), job_id),
+                    )
+                except sqlite3.DatabaseError:
+                    pass
+        if name:
+            try:
+                os.remove(self._staging_path(name))
+            except FileNotFoundError:
+                pass
+            except OSError:
+                # Retried on the next startup by reclaim_storage().
+                pass
+
+    # -- queue -------------------------------------------------------------
 
     def _resume_queued(self) -> None:
         """Re-enqueue jobs that were accepted but not processed before a restart."""
@@ -111,6 +206,13 @@ class JobWorker:
                 self._thread.start()
 
     def submit(self, kind: str, payload: dict) -> int:
+        # Raw CSV lives in the staging directory while the job is queued or
+        # running; only its file name is persisted in the database, keeping
+        # SQLite small enough for the next import even after repeated uploads.
+        if "csv" in payload:
+            name = self._write_staging(kind, payload["csv"])
+            payload = {**payload, "csv_file": name}
+            payload.pop("csv", None)
         conn = connect(self.db_path)
         try:
             cur = conn.execute(
@@ -154,6 +256,9 @@ class JobWorker:
 
             try:
                 payload = json.loads(job["payload"])
+                csv_text = self._load_csv_text(payload)
+                if csv_text is not None:
+                    payload["csv"] = csv_text
                 run_id = _apply_mutation(conn, job["kind"], payload)
             except Exception as exc:
                 try:
@@ -176,12 +281,21 @@ class JobWorker:
                 conn.execute("ROLLBACK")
             except Exception:
                 pass
-            conn.execute(
-                "UPDATE jobs SET status = 'failed', error = ?, finished_at = ? "
-                "WHERE id = ?",
-                (f"{type(exc).__name__}: {exc}", utcnow(), job_id),
-            )
+            try:
+                conn.execute(
+                    "UPDATE jobs SET status = 'failed', error = ?, finished_at = ? "
+                    "WHERE id = ?",
+                    (f"{type(exc).__name__}: {exc}", utcnow(), job_id),
+                )
+            except sqlite3.DatabaseError:
+                pass
         finally:
+            # The job has reached a terminal state: its raw CSV is no longer
+            # needed and the staging space must be reusable.
+            try:
+                self._release_staging(conn, job_id)
+            except Exception:
+                logger.exception("释放作业 %s 的暂存 CSV 失败", job_id)
             conn.close()
 
 
@@ -386,19 +500,27 @@ def read_run(conn, run_id: int) -> dict | None:
 
 
 def latest_job(conn):
-    return conn.execute("SELECT * FROM jobs ORDER BY id DESC LIMIT 1").fetchone()
+    # Only summary columns: the polling endpoint must never parse or ship the
+    # raw CSV payload.
+    return conn.execute(
+        "SELECT id, kind, status, error, created_at, started_at, finished_at, "
+        "run_id FROM jobs ORDER BY id DESC LIMIT 1"
+    ).fetchone()
+
+
+JOB_SUMMARY_COLUMNS = (
+    "id, kind, status, error, created_at, started_at, finished_at, run_id"
+)
 
 
 def job_view(job) -> dict | None:
     if job is None:
         return None
-    payload = json.loads(job["payload"])
-    payload.pop("csv", None)  # never ship raw CSV to the browser
     return {
         "id": job["id"], "kind": job["kind"], "status": job["status"],
         "error": job["error"], "created_at": job["created_at"],
-        "finished_at": job["finished_at"], "run_id": job["run_id"],
-        "payload": payload,
+        "started_at": job["started_at"], "finished_at": job["finished_at"],
+        "run_id": job["run_id"],
     }
 
 
@@ -493,9 +615,12 @@ def register_routes(app: Flask):
             rows = engine.parse_answer_csv(raw)
         except engine.ValidationError as exc:
             return _back(str(exc))
-        app.worker.submit(
-            "upload_answers", {"csv": engine.decode_csv(raw)}
-        )
+        try:
+            app.worker.submit(
+                "upload_answers", {"csv": engine.decode_csv(raw)}
+            )
+        except OSError as exc:
+            return _back(f"暂存空间不足，无法保存 CSV 原文：{exc}")
         return _back(None, f"已受理 {len(rows)} 行答题数据，正在重算")
 
     @app.post("/forms")
@@ -511,10 +636,13 @@ def register_routes(app: Flask):
             engine.parse_form_csv(raw)
         except engine.ValidationError as exc:
             return _back(str(exc))
-        app.worker.submit(
-            "upload_form",
-            {"name": name, "csv": engine.decode_csv(raw)},
-        )
+        try:
+            app.worker.submit(
+                "upload_form",
+                {"name": name, "csv": engine.decode_csv(raw)},
+            )
+        except OSError as exc:
+            return _back(f"暂存空间不足，无法保存 CSV 原文：{exc}")
         return _back(None, f"卷式「{name}」已受理，正在重算")
 
     @app.post("/forms/correct")
@@ -549,9 +677,12 @@ def register_routes(app: Flask):
     @app.get("/api/status")
     def api_status():
         conn = get_db()
+        # Polling reads job summaries only (queued/running included); payloads
+        # with raw CSV references are never parsed here or sent to the browser.
         jobs = [
             job_view(r) for r in conn.execute(
-                "SELECT * FROM jobs ORDER BY id DESC LIMIT 6"
+                f"SELECT {JOB_SUMMARY_COLUMNS} FROM jobs "
+                "ORDER BY id DESC LIMIT 6"
             )
         ]
         return jsonify({
